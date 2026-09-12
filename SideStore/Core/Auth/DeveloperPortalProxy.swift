@@ -254,7 +254,8 @@ class DeveloperPortalProxyWithAuth: DeveloperPortalProxy {
                 xcodeVersion: String, 
                 machinePassword: String? = nil,
                 accountRepairHandler: DeveloperPortal.AccountRepairHandler = DeveloperPortal.defaultAccountRepairHandler,
-                verificationHandler: DeveloperPortal.VerificationHandler?) async throws -> (ALTAccount, ALTAppleAPISession) 
+                verificationHandler: DeveloperPortal.VerificationHandler?,
+                securityKeyHandler: DeveloperPortal.SecurityKeyHandler? = nil) async throws -> (ALTAccount, ALTAppleAPISession) 
     {
         let authSession = try await ALTAppleAPI.shared.authenticate(
             appleID: appleID,
@@ -263,7 +264,8 @@ class DeveloperPortalProxyWithAuth: DeveloperPortalProxy {
             xcodeVersion: xcodeVersion,
             machinePassword: machinePassword,
             accountRepairHandler: accountRepairHandler,
-            verificationHandler: verificationHandler
+            verificationHandler: verificationHandler,
+            securityKeyHandler: securityKeyHandler
         )
         return (authSession.account, authSession.session)
     }

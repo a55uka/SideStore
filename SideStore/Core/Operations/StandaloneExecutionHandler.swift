@@ -26,6 +26,12 @@ enum RevokeDecision {
 protocol SignInHandler: AnyObject {
     func credentials() async throws -> (String, String)
     func verificationCode(for request: TwoFactorRequest) async throws -> TwoFactorResponse
+    /// Performs the WebAuthn assertion with the user's hardware security key
+    /// when Apple demands one during sign-in. Implementations drive the
+    /// platform authenticator UI and return the signed assertion for SideSign
+    /// to submit to Apple, or throw (e.g. `DeveloperPortalError.userCancelled`)
+    /// to abort the sign-in.
+    func securityKeyAssertion(for challenge: SecurityKeyChallenge) async throws -> SecurityKeyAssertion
     func accountRepair(url: URL, message: String) async -> AccountRepairDecision
     func handleSignInResult(_ result: Result<(ALTAccount, ALTAppleAPISession), Error>) async
     

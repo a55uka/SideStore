@@ -279,6 +279,9 @@ final class SignInOperation: BaseStandaloneOperation<StandaloneOperationContext,
             },
             verificationHandler: { request in
                 try await handler.verificationCode(for: request)
+            },
+            securityKeyHandler: { challenge in
+                try await handler.securityKeyAssertion(for: challenge)
             }
         )
         

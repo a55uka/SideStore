@@ -7,6 +7,7 @@
 //
 
 import UIKit
+import AuthenticationServices
 import SideSign
 
 class SignInFlowHandler: AnyObject, SignInHandler, AnisetteServerHandler {
@@ -193,6 +194,136 @@ class SignInFlowHandler: AnyObject, SignInHandler, AnisetteServerHandler {
 
             self.present(alert)
         }
+    }
+
+    // MARK: - Security Key (FIDO2) Sign-In
+    //
+    // Invoked (through SideSign's `DeveloperPortal.SecurityKeyHandler`) when
+    // Apple reports that the signing-in Apple ID requires a hardware security
+    // key. The protocol half — fetching the fsaChallenge and submitting the
+    // assertion to Apple — lives in SideSign; the handler below performs the
+    // WebAuthn `get` ceremony with the physical key via the system
+    // security-key sheet, which owns the NFC tap, PIN entry, and retry UX.
+
+    @MainActor
+    func securityKeyAssertion(for challenge: SecurityKeyChallenge) async throws -> SecurityKeyAssertion {
+        // Apple's own security-key support requires iOS 16, and the system
+        // sheet with user-verification support used below matches that floor.
+        guard #available(iOS 16.0, *) else {
+            throw OperationError.invalidOperationContext("Security key sign-in requires iOS 16 or newer. Please update your device, or sign in with an Apple ID that is not protected by a security key.")
+        }
+        guard self.isPresenterAvailable else {
+            throw OperationError.invalidOperationContext("SignInFlowHandler: Cannot prompt for security key because presenting view controller is unavailable")
+        }
+
+        // Explain the step before the system sheet takes over; the user may
+        // know their key is out of reach and prefer to abort up front.
+        try await self.presentSecurityKeyIntroAlert(for: challenge)
+
+        // Assertion loop: recoverable failures (NFC glitch, key timeout, wrong
+        // key presented) offer the same Retry/Cancel choice as the 2FA prompts.
+        while true {
+            do {
+                let credential = try await self.requestSecurityKeyAssertion(for: challenge)
+                return try Self.makeSecurityKeyAssertion(from: credential)
+            } catch let error as ASAuthorizationError where error.code == .canceled {
+                // The user dismissed the system sheet — treat exactly like
+                // cancelling a 2FA prompt.
+                throw DeveloperPortalError.userCancelled
+            } catch {
+                let shouldRetry = try await self.showErrorRetryAlert(message: error.localizedDescription)
+                guard shouldRetry else {
+                    throw DeveloperPortalError.userCancelled
+                }
+            }
+        }
+    }
+
+    /// Explains the security-key step and lets the user back out before the
+    /// system-owned sheet appears.
+    @MainActor
+    private func presentSecurityKeyIntroAlert(for challenge: SecurityKeyChallenge) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let keyNames = challenge.keyNames.joined(separator: ", ")
+            let keyDescription = keyNames.isEmpty
+                ? NSLocalizedString("your enrolled security key", comment: "")
+                : keyNames
+
+            let alert = UIAlertController(
+                title: NSLocalizedString("Security Key Required", comment: ""),
+                message: String(
+                    format: NSLocalizedString(
+                        "This Apple ID is protected with a hardware security key.\n\nHold %@ near the top of your device when prompted, then follow the on-screen instructions.",
+                        comment: ""
+                    ),
+                    keyDescription
+                ),
+                preferredStyle: .alert
+            )
+
+            alert.addAction(UIAlertAction(title: NSLocalizedString("Continue", comment: ""), style: .default) { _ in
+                continuation.resume()
+            })
+
+            alert.addAction(UIAlertAction(title: systemLocalizedString("Cancel"), style: .cancel) { _ in
+                continuation.resume(throwing: DeveloperPortalError.userCancelled)
+            })
+
+            self.present(alert)
+        }
+    }
+
+    /// Presents the system security-key sheet and resolves with the credential
+    /// the physical key produced.
+    @available(iOS 16.0, *)
+    @MainActor
+    private func requestSecurityKeyAssertion(for challenge: SecurityKeyChallenge) async throws -> ASAuthorizationSecurityKeyPublicKeyCredentialAssertion {
+        // The coordinator is retained by this async frame for the duration of
+        // the ceremony, which in turn keeps the controller (and thereby its
+        // weak delegate reference) alive.
+        let coordinator = SecurityKeyAssertionCoordinator(
+            challenge: challenge,
+            presentationAnchor: { [weak self] in
+                self?.securityKeyPresentationAnchor() ?? ASPresentationAnchor()
+            }
+        )
+        return try await coordinator.perform()
+    }
+
+    /// Resolves the window the system security-key sheet should present from:
+    /// the window currently showing the sign-in flow, falling back to any
+    /// active foreground window.
+    @MainActor
+    private func securityKeyPresentationAnchor() -> ASPresentationAnchor {
+        if let window = self.activePresenter?.view.window {
+            return window
+        }
+        return UIApplication.shared.connectedScenes
+            .compactMap { ($0 as? UIWindowScene)?.keyWindow }
+            .first
+            ?? ASPresentationAnchor()
+    }
+
+    /// Maps the system credential onto the wire-format assertion SideSign
+    /// submits to Apple. The signed `clientDataJSON` is forwarded verbatim —
+    /// the signature covers those exact bytes, so it must never be rebuilt.
+    @available(iOS 16.0, *)
+    @MainActor
+    private static func makeSecurityKeyAssertion(from credential: ASAuthorizationSecurityKeyPublicKeyCredentialAssertion) throws -> SecurityKeyAssertion {
+        guard !credential.credentialID.isEmpty,
+              !credential.rawAuthenticatorData.isEmpty,
+              !credential.signature.isEmpty
+        else {
+            throw DeveloperPortalError.securityKeyVerificationFailed(cause: "The security key returned an incomplete assertion.")
+        }
+
+        return SecurityKeyAssertion(
+            credentialID: credential.credentialID,
+            clientDataJSON: credential.rawClientDataJSON,
+            authenticatorData: credential.rawAuthenticatorData,
+            signature: credential.signature,
+            userHandle: credential.userID
+        )
     }
 
     @MainActor
@@ -651,5 +782,93 @@ class SignInFlowHandler: AnyObject, SignInHandler, AnisetteServerHandler {
             
             presenter.present(alert, animated: true)
         }
+    }
+}
+
+// MARK: - Security Key Assertion Coordinator
+//
+// Drives a single `ASAuthorizationController` security-key ceremony and
+// delivers the credential through async/await: it builds the assertion request
+// from SideSign's challenge, presents the system sheet (NFC tap, PIN entry),
+// and resumes exactly once — with the credential on success, or with the
+// `ASAuthorizationError` on failure/cancellation.
+//
+// Subclasses NSObject because the controller's delegate and presentation
+// context protocols are @objc and require NSObjectProtocol.
+
+@available(iOS 16.0, *)
+@MainActor
+private final class SecurityKeyAssertionCoordinator: NSObject, ASAuthorizationControllerDelegate, ASAuthorizationControllerPresentationContextProviding {
+
+    private let challenge: SecurityKeyChallenge
+    private let presentationAnchor: @MainActor () -> ASPresentationAnchor
+    /// Retained so the ceremony outlives the synchronous `perform()` body.
+    private var controller: ASAuthorizationController?
+    /// Resumed exactly once by the delegate callbacks below.
+    private var continuation: CheckedContinuation<ASAuthorizationSecurityKeyPublicKeyCredentialAssertion, Error>?
+
+    init(challenge: SecurityKeyChallenge, presentationAnchor: @escaping @MainActor () -> ASPresentationAnchor) {
+        self.challenge = challenge
+        self.presentationAnchor = presentationAnchor
+    }
+
+    /// Builds the request, presents the system sheet, and awaits the outcome.
+    func perform() async throws -> ASAuthorizationSecurityKeyPublicKeyCredentialAssertion {
+        // Apple issues the challenge as base64 (standard or URL-safe, padded
+        // or not); the authenticator signs over the raw bytes, so decode first.
+        guard let challengeData = SecurityKeyChallengeParser.decodeFlexibleBase64(challenge.challenge) else {
+            throw DeveloperPortalError.securityKeyChallengeUnavailable(cause: "Apple's security key challenge is not valid base64.")
+        }
+
+        let provider = ASAuthorizationSecurityKeyPublicKeyCredentialProvider(relyingPartyIdentifier: challenge.relyingPartyIdentifier)
+        let request = provider.createCredentialAssertionRequest(challenge: challengeData)
+        // Restrict the ceremony to the keys enrolled with this Apple ID;
+        // NFC covers iPhone sign-in, USB covers adapter-attached keys.
+        request.allowedCredentials = challenge.allowedCredentials.map {
+            ASAuthorizationSecurityKeyPublicKeyCredentialDescriptor(credentialID: $0, transports: [.nfc, .usb])
+        }
+        // Apple enforces user verification on enrolled keys (matching its web
+        // sign-in), so ask for it up front — the system sheet collects the PIN.
+        request.userVerificationPreference = .required
+
+        return try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+            let controller = ASAuthorizationController(authorizationRequests: [request])
+            // The controller retains neither its delegate nor its presentation
+            // context provider — this coordinator holds the controller, and
+            // the awaiting caller holds the coordinator.
+            self.controller = controller
+            controller.delegate = self
+            controller.presentationContextProvider = self
+            controller.performRequests()
+        }
+    }
+
+    // MARK: ASAuthorizationControllerDelegate
+
+    func authorizationController(controller: ASAuthorizationController, didCompleteWithAuthorization authorization: ASAuthorization) {
+        guard let continuation = self.continuation else { return }
+        self.continuation = nil
+        self.controller = nil
+
+        guard let credential = authorization.credential as? ASAuthorizationSecurityKeyPublicKeyCredentialAssertion else {
+            continuation.resume(throwing: DeveloperPortalError.securityKeyVerificationFailed(cause: "The security key returned an unexpected credential type."))
+            return
+        }
+        continuation.resume(returning: credential)
+    }
+
+    func authorizationController(controller: ASAuthorizationController, didCompleteWithError error: any Error) {
+        guard let continuation = self.continuation else { return }
+        self.continuation = nil
+        self.controller = nil
+
+        continuation.resume(throwing: error)
+    }
+
+    // MARK: ASAuthorizationControllerPresentationContextProviding
+
+    func presentationAnchor(for controller: ASAuthorizationController) -> ASPresentationAnchor {
+        self.presentationAnchor()
     }
 }

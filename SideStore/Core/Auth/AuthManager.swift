@@ -168,7 +168,8 @@ public final class AuthManager: @unchecked Sendable {
                        xcodeVersion: String, 
                        machinePassword: String? = nil,
                        accountRepairHandler: DeveloperPortal.AccountRepairHandler = DeveloperPortal.defaultAccountRepairHandler,
-                       verificationHandler: DeveloperPortal.VerificationHandler?) async throws -> (ALTAccount, ALTAppleAPISession) 
+                       verificationHandler: DeveloperPortal.VerificationHandler?,
+                       securityKeyHandler: DeveloperPortal.SecurityKeyHandler? = nil) async throws -> (ALTAccount, ALTAppleAPISession) 
     {
         return try await self.portalProxy.signIn(
             appleID: appleID, 
@@ -177,7 +178,8 @@ public final class AuthManager: @unchecked Sendable {
             xcodeVersion: xcodeVersion, 
             machinePassword: machinePassword,
             accountRepairHandler: accountRepairHandler, 
-            verificationHandler: verificationHandler
+            verificationHandler: verificationHandler,
+            securityKeyHandler: securityKeyHandler
         )
     }
     
